@@ -2261,6 +2261,7 @@ st_general_foreach(st_table *tab, st_foreach_check_callback_func *func, st_updat
             continue;
         key = curr_entry_ptr->key;
         rebuilds_num = tab->rebuilds_num;
+        hash = probe_hash(tab, key, ST_HASH_AT_PTR(tab, curr_entry_ptr));
         retval = (*func)(key, curr_entry_ptr->record, arg, 0);
 
         if (retval == ST_REPLACE && replace) {
@@ -2272,7 +2273,6 @@ st_general_foreach(st_table *tab, st_foreach_check_callback_func *func, st_updat
         }
 
         if (rebuilds_num != tab->rebuilds_num) {
-            hash = do_hash(key, tab);
             /* The callback caused a rebuild; entries[] indices may have
              * shifted, so re-find by hash + key. */
         retry:
@@ -2310,7 +2310,6 @@ st_general_foreach(st_table *tab, st_foreach_check_callback_func *func, st_updat
             return 0;
           case ST_DELETE: {
             st_data_t key = curr_entry_ptr->key;
-            hash = probe_hash(tab, key, ST_HASH_AT_PTR(tab, curr_entry_ptr));
 
               again:
             if (packed_p) {
