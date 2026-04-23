@@ -256,7 +256,7 @@ typedef uint32_t st_hash32_t;
  * machinery further down. Below this entry_power, do not use the
  * Swiss-bins fast path. */
 #ifndef SWISS_MIN_ENTRY_POWER
-#define SWISS_MIN_ENTRY_POWER 6
+#define SWISS_MIN_ENTRY_POWER 5
 #endif
 #endif
 
@@ -415,9 +415,10 @@ probe_hash(st_table *tab, st_data_t key, st_hash_t stored_hash)
 {
 #ifdef ST_USE_SWISS_BINS
     /* The compact hashes[] array stores only the low 32 bits. That is
-     * enough when ctrl[] is active, but the legacy perturb chain depends on
-     * the full hash to reproduce the probe sequence after rebuilds. */
-    if (tab->ctrl == NULL) {
+     * enough for packed tables (which linearly scan entries[]) and for the
+     * Swiss ctrl[] path, but the legacy perturb chain still needs the full
+     * hash to reproduce its probe sequence after rebuilds. */
+    if (tab->ctrl == NULL && tab->bins != NULL) {
         return do_hash(key, tab);
     }
 #endif
@@ -725,15 +726,16 @@ stat_col(void)
 /* Below this entry_power, do not use the Swiss path: stay on the existing
  * perturb-chain or no-bins layout. Tunable; benchmark to refine.
  *
- * Floor: SWISS_MIN_ENTRY_POWER must guarantee bin_count >= ST_SWISS_GROUP_SIZE
- * so a single group load covers a full power-of-two slice. Swiss-active
- * tables override bin_power = entry_power (see table_bin_power_for), so at
- * entry_power=6 we have bin_count=64 = 8 groups, the minimum that still
- * makes triangular probing meaningful. The macro is forward-defined near
- * the top of the file so the layout helpers can see it; the real
+ * Floor: SWISS_MIN_ENTRY_POWER must stay above the packed-table cutoff and
+ * guarantee bin_count >= ST_SWISS_GROUP_SIZE so a single group load covers a
+ * full power-of-two slice. Swiss-active tables override bin_power =
+ * entry_power (see table_bin_power_for), so at entry_power=5 we have
+ * bin_count=32 = 4 groups, which is the first bin-backed size and still
+ * preserves the triangular-probing invariants. The macro is forward-defined
+ * near the top of the file so the layout helpers can see it; the real
  * documentation lives here. */
 #ifndef SWISS_MIN_ENTRY_POWER
-#define SWISS_MIN_ENTRY_POWER 6
+#define SWISS_MIN_ENTRY_POWER 5
 #endif
 
 /* Control byte values. 0x00..0x7f = occupied (top bit clear, holds H2). */
