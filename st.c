@@ -731,12 +731,9 @@ stat_col(void)
  * full power-of-two slice. Swiss-active tables override bin_power =
  * entry_power (see table_bin_power_for), so at entry_power=5 we have
  * bin_count=32 = 4 groups, which is the first bin-backed size and still
- * preserves the triangular-probing invariants. The macro is forward-defined
- * near the top of the file so the layout helpers can see it; the real
- * documentation lives here. */
-#ifndef SWISS_MIN_ENTRY_POWER
-#define SWISS_MIN_ENTRY_POWER 5
-#endif
+ * preserves the triangular-probing invariants. SWISS_MIN_ENTRY_POWER is
+ * defined near the top of the file so earlier layout helpers can use it;
+ * the detailed rationale lives here. */
 
 /* Control byte values. 0x00..0x7f = occupied (top bit clear, holds H2). */
 #define ST_SWISS_CTRL_EMPTY   ((unsigned char)0xff)
