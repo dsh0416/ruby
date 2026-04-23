@@ -18,10 +18,6 @@
  * --enable-swiss-st flag. */
 #undef ST_USE_SWISS_BINS
 
-/* The opt-in measurement subsystem is also disabled for parser_st to keep
- * the parser self-contained and free of process-wide stats globals. */
-#undef ST_STATS
-
 #undef MEMCPY
 #define MEMCPY(p1,p2,type,n) nonempty_memcpy((p1), (p2), (sizeof(type) * (n)))
 /* The multiplication should not overflow since this macro is used

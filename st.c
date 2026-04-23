@@ -682,253 +682,6 @@ stat_col(void)
 #endif
 
 /* ===========================================================================
- * Optional measurement subsystem (ST_STATS).
- *
- * Compiled in only when ST_STATS is defined. Activated at runtime when the
- * RUBY_ST_STATS environment variable is set to a non-empty value other than
- * "0". When disabled at compile time, every macro below expands to a no-op
- * and there is zero impact on the generated code.
- *
- * On exit (when enabled at runtime) a human-readable report is written to
- * /tmp/ruby_st_stats.<pid>. The report covers:
- *   - find probe-length histogram, split by hit vs miss
- *   - total operation counts (lookup / insert / delete)
- *   - rebuild / compaction / resize counts
- *   - histogram of table sizes observed at rebuild time
- *   - top-N callsites of the public API (st_lookup/st_insert/st_delete/...)
- * ========================================================================= */
-
-/* These op identifiers are always defined so that ST_STATS_* macro arguments
- * are valid tokens regardless of whether ST_STATS is enabled. */
-#define ST_STATS_OP_LOOKUP 0
-#define ST_STATS_OP_INSERT 1
-#define ST_STATS_OP_DELETE 2
-#define ST_STATS_OP_OTHER  3
-#define ST_STATS_OP_COUNT  4
-
-#ifdef ST_STATS
-#include <inttypes.h>
-
-#define ST_STATS_PROBE_BUCKETS 9
-#define ST_STATS_CALLSITE_SLOTS 1024
-#define ST_STATS_SIZE_HIST_BUCKETS 33
-
-struct st_stats_probe_data {
-    uint64_t calls;
-    uint64_t total_probes;
-    uint64_t hist[ST_STATS_PROBE_BUCKETS];
-};
-
-struct st_stats_callsite {
-    void *addr;
-    uint64_t counts[ST_STATS_OP_COUNT];
-};
-
-static struct {
-    int initialized;
-    int enabled;
-    /* Per-find probe statistics, separated by outcome. */
-    struct st_stats_probe_data find_hit;
-    struct st_stats_probe_data find_miss;
-    /* Public-API call counts. */
-    uint64_t op_calls[ST_STATS_OP_COUNT];
-    /* Rebuild accounting. */
-    uint64_t rebuilds;
-    uint64_t compactions;
-    uint64_t resizes;
-    /* Histogram of num_entries at rebuild time, indexed by floor(log2(n))+1. */
-    uint64_t rebuild_size_hist[ST_STATS_SIZE_HIST_BUCKETS];
-    /* Bounded per-callsite table. Linear scan is fine: this is for analysis. */
-    struct st_stats_callsite callsites[ST_STATS_CALLSITE_SLOTS];
-    int callsites_used;
-} st_stats;
-
-static void st_stats_dump(void);
-
-static void
-st_stats_init(void)
-{
-    if (st_stats.initialized) return;
-    const char *env = getenv("RUBY_ST_STATS");
-    st_stats.enabled = env != NULL && env[0] != '\0' && env[0] != '0';
-    if (st_stats.enabled) atexit(st_stats_dump);
-    st_stats.initialized = 1;
-}
-
-static inline int
-st_stats_probe_bucket(uint32_t probes)
-{
-    /* 1, 2, 3, 4, 5-8, 9-16, 17-32, 33-64, 65+ */
-    if (probes <= 1) return 0;
-    if (probes <= 2) return 1;
-    if (probes <= 3) return 2;
-    if (probes <= 4) return 3;
-    if (probes <= 8) return 4;
-    if (probes <= 16) return 5;
-    if (probes <= 32) return 6;
-    if (probes <= 64) return 7;
-    return 8;
-}
-
-static inline int
-st_stats_log2_bucket(st_index_t n)
-{
-    int b = 0;
-    while (n > 0 && b < ST_STATS_SIZE_HIST_BUCKETS - 1) {
-        n >>= 1;
-        b++;
-    }
-    return b;
-}
-
-static void
-st_stats_record_probes(uint32_t probes, int hit)
-{
-    if (!st_stats.enabled) return;
-    struct st_stats_probe_data *d = hit ? &st_stats.find_hit : &st_stats.find_miss;
-    d->calls++;
-    d->total_probes += probes;
-    d->hist[st_stats_probe_bucket(probes)]++;
-}
-
-static void
-st_stats_record_op(int op)
-{
-    if (!st_stats.enabled) return;
-    if (op < 0 || op >= ST_STATS_OP_COUNT) return;
-    st_stats.op_calls[op]++;
-}
-
-static void
-st_stats_record_callsite(void *addr, int op)
-{
-    if (!st_stats.enabled) return;
-    if (op < 0 || op >= ST_STATS_OP_COUNT) return;
-    int i;
-    for (i = 0; i < st_stats.callsites_used; i++) {
-        if (st_stats.callsites[i].addr == addr) {
-            st_stats.callsites[i].counts[op]++;
-            return;
-        }
-    }
-    if (st_stats.callsites_used >= ST_STATS_CALLSITE_SLOTS) return;
-    st_stats.callsites[st_stats.callsites_used].addr = addr;
-    st_stats.callsites[st_stats.callsites_used].counts[op] = 1;
-    st_stats.callsites_used++;
-}
-
-static void
-st_stats_record_rebuild(st_index_t entries_at_rebuild, int is_compaction)
-{
-    if (!st_stats.enabled) return;
-    st_stats.rebuilds++;
-    if (is_compaction) st_stats.compactions++;
-    else st_stats.resizes++;
-    st_stats.rebuild_size_hist[st_stats_log2_bucket(entries_at_rebuild)]++;
-}
-
-static int
-st_stats_callsite_compare(const void *a, const void *b)
-{
-    const struct st_stats_callsite *ca = a;
-    const struct st_stats_callsite *cb = b;
-    uint64_t ta = ca->counts[0] + ca->counts[1] + ca->counts[2] + ca->counts[3];
-    uint64_t tb = cb->counts[0] + cb->counts[1] + cb->counts[2] + cb->counts[3];
-    if (ta < tb) return 1;
-    if (ta > tb) return -1;
-    return 0;
-}
-
-static void
-st_stats_dump_probe(FILE *f, const char *label, const struct st_stats_probe_data *d)
-{
-    if (d->calls == 0) {
-        fprintf(f, "  %s: (no calls)\n", label);
-        return;
-    }
-    fprintf(f, "  %s: %" PRIu64 " calls, %" PRIu64 " probes, avg %.2f\n",
-            label, d->calls, d->total_probes,
-            (double)d->total_probes / (double)d->calls);
-    fprintf(f, "    histogram (1, 2, 3, 4, 5-8, 9-16, 17-32, 33-64, 65+):");
-    int b;
-    for (b = 0; b < ST_STATS_PROBE_BUCKETS; b++) {
-        fprintf(f, " %" PRIu64, d->hist[b]);
-    }
-    fprintf(f, "\n");
-}
-
-static void
-st_stats_dump(void)
-{
-    char fname[64];
-    snprintf(fname, sizeof(fname), "/tmp/ruby_st_stats.%ld", (long)getpid());
-    FILE *f = fopen(fname, "w");
-    if (f == NULL) return;
-
-    fprintf(f, "=== Ruby st_table stats (pid %ld) ===\n\n", (long)getpid());
-
-    fprintf(f, "Public API calls:\n");
-    fprintf(f, "  lookup: %" PRIu64 "\n", st_stats.op_calls[ST_STATS_OP_LOOKUP]);
-    fprintf(f, "  insert: %" PRIu64 "\n", st_stats.op_calls[ST_STATS_OP_INSERT]);
-    fprintf(f, "  delete: %" PRIu64 "\n", st_stats.op_calls[ST_STATS_OP_DELETE]);
-    fprintf(f, "  other:  %" PRIu64 "\n", st_stats.op_calls[ST_STATS_OP_OTHER]);
-
-    fprintf(f, "\nProbe statistics:\n");
-    st_stats_dump_probe(f, "hits ", &st_stats.find_hit);
-    st_stats_dump_probe(f, "miss ", &st_stats.find_miss);
-
-    fprintf(f, "\nRebuild accounting:\n");
-    fprintf(f, "  rebuilds: %" PRIu64 " (compactions: %" PRIu64 ", resizes: %" PRIu64 ")\n",
-            st_stats.rebuilds, st_stats.compactions, st_stats.resizes);
-    fprintf(f, "  num_entries at rebuild (by 2^k):\n");
-    int p;
-    for (p = 0; p < ST_STATS_SIZE_HIST_BUCKETS; p++) {
-        if (st_stats.rebuild_size_hist[p]) {
-            fprintf(f, "    2^%-2d: %" PRIu64 "\n", p, st_stats.rebuild_size_hist[p]);
-        }
-    }
-
-    fprintf(f, "\nTop callsites of public API (lookup/insert/delete/other):\n");
-    qsort(st_stats.callsites, (size_t)st_stats.callsites_used,
-          sizeof(struct st_stats_callsite), st_stats_callsite_compare);
-    int n = st_stats.callsites_used < 30 ? st_stats.callsites_used : 30;
-    int i;
-    for (i = 0; i < n; i++) {
-        const struct st_stats_callsite *cs = &st_stats.callsites[i];
-        fprintf(f, "  %p  L=%" PRIu64 " I=%" PRIu64 " D=%" PRIu64 " O=%" PRIu64 "\n",
-                cs->addr,
-                cs->counts[ST_STATS_OP_LOOKUP],
-                cs->counts[ST_STATS_OP_INSERT],
-                cs->counts[ST_STATS_OP_DELETE],
-                cs->counts[ST_STATS_OP_OTHER]);
-    }
-
-    fclose(f);
-}
-
-#define ST_STATS_DECLARE_PROBE() uint32_t _st_probes = 0
-#define ST_STATS_BUMP_PROBE() ((void)(++_st_probes))
-#define ST_STATS_RECORD_PROBES(hit) st_stats_record_probes(_st_probes, (hit))
-#define ST_STATS_RECORD_OP(op) st_stats_record_op(op)
-#define ST_STATS_RECORD_CALLSITE(op) \
-    st_stats_record_callsite(__builtin_return_address(0), (op))
-#define ST_STATS_RECORD_REBUILD(entries, is_compaction) \
-    st_stats_record_rebuild((entries), (is_compaction))
-#define ST_STATS_INIT() st_stats_init()
-
-#else /* !ST_STATS */
-
-#define ST_STATS_DECLARE_PROBE() ((void)0)
-#define ST_STATS_BUMP_PROBE() ((void)0)
-#define ST_STATS_RECORD_PROBES(hit) ((void)0)
-#define ST_STATS_RECORD_OP(op) ((void)0)
-#define ST_STATS_RECORD_CALLSITE(op) ((void)0)
-#define ST_STATS_RECORD_REBUILD(entries, is_compaction) ((void)0)
-#define ST_STATS_INIT() ((void)0)
-
-#endif /* ST_STATS */
-
-/* ===========================================================================
  * Swiss-table-style bins backend (compile-time gated by
  * ST_USE_SWISS_BINS). Adds a parallel control-byte array (tab->ctrl) used as
  * a fast pre-filter during probing. The existing entries[] log is unchanged
@@ -1157,8 +910,6 @@ st_init_existing_table_with_size(st_table *tab, const struct st_hash_type *type,
         atexit(stat_col);
     }
 #endif
-
-    ST_STATS_INIT();
 
     n = get_power2(size);
 #ifndef RUBY
@@ -1464,13 +1215,10 @@ static void rebuild_cleanup(st_table *const tab);
 static void
 rebuild_table(st_table *tab)
 {
-    st_index_t entries_at_rebuild = tab->num_entries;
-    int is_compaction;
     if ((2 * tab->num_entries <= get_allocated_entries(tab)
          && REBUILD_THRESHOLD * tab->num_entries > get_allocated_entries(tab))
         || tab->num_entries < (1 << MINIMAL_POWER2)) {
         /* Compaction: */
-        is_compaction = 1;
         tab->num_entries = 0;
         if (tab->bins != NULL)
             initialize_bins(tab);
@@ -1486,7 +1234,6 @@ rebuild_table(st_table *tab)
     }
     else {
         st_table *new_tab;
-        is_compaction = 0;
         /* This allocation could trigger GC and compaction. If tab is the
          * gen_fields_tbl, then tab could have changed in size due to objects being
          * freed and/or moved. Do not store attributes of tab before this line. */
@@ -1496,9 +1243,6 @@ rebuild_table(st_table *tab)
         rebuild_move_table(new_tab, tab);
     }
     rebuild_cleanup(tab);
-    ST_STATS_RECORD_REBUILD(entries_at_rebuild, is_compaction);
-    (void)entries_at_rebuild;
-    (void)is_compaction;
 }
 
 static void
@@ -1597,21 +1341,16 @@ find_entry(st_table *tab, st_hash_t hash_value, st_data_t key)
     int eq_p, rebuilt_p;
     st_index_t i, bound;
     st_table_entry *entries;
-    ST_STATS_DECLARE_PROBE();
 
     bound = tab->entries_bound;
     entries = tab->entries;
     for (i = tab->entries_start; i < bound; i++) {
-        ST_STATS_BUMP_PROBE();
         DO_PTR_EQUAL_CHECK(tab, &entries[i], hash_value, key, eq_p, rebuilt_p);
         if (EXPECT(rebuilt_p, 0))
             return REBUILT_TABLE_ENTRY_IND;
-        if (eq_p) {
-            ST_STATS_RECORD_PROBES(1);
+        if (eq_p)
             return i;
-        }
     }
-    ST_STATS_RECORD_PROBES(0);
     return UNDEFINED_ENTRY_IND;
 }
 
@@ -1635,7 +1374,6 @@ find_table_entry_ind(st_table *tab, st_hash_t hash_value, st_data_t key)
 #endif
     st_index_t bin;
     st_table_entry *entries = tab->entries;
-    ST_STATS_DECLARE_PROBE();
 
 #ifdef ST_USE_SWISS_BINS
     if (swiss_active_p(tab)) {
@@ -1645,7 +1383,6 @@ find_table_entry_ind(st_table *tab, st_hash_t hash_value, st_data_t key)
         st_index_t group_idx = st_swiss_first_group(tab, hash_value);
         st_index_t step = 0;
         for (;;) {
-            ST_STATS_BUMP_PROBE();
             swiss_group_t g = st_swiss_load_group(tab->ctrl + group_idx);
             swiss_match_t mh2 = st_swiss_match_byte(g, h2);
             while (st_swiss_match_any(mh2)) {
@@ -1662,17 +1399,13 @@ find_table_entry_ind(st_table *tab, st_hash_t hash_value, st_data_t key)
                                        hash_value, key, eq_p, rebuilt_p);
                     if (EXPECT(rebuilt_p, 0))
                         return REBUILT_TABLE_ENTRY_IND;
-                    if (eq_p) {
-                        ST_STATS_RECORD_PROBES(1);
+                    if (eq_p)
                         return cand_bin;
-                    }
                 }
                 mh2 = st_swiss_match_drop(mh2);
             }
-            if (st_swiss_match_any(st_swiss_match_empty(g))) {
-                ST_STATS_RECORD_PROBES(0);
+            if (st_swiss_match_any(st_swiss_match_empty(g)))
                 return UNDEFINED_ENTRY_IND;
-            }
             step += ST_SWISS_GROUP_SIZE;
             group_idx = (group_idx + step) & mask;
         }
@@ -1687,7 +1420,6 @@ find_table_entry_ind(st_table *tab, st_hash_t hash_value, st_data_t key)
 #endif
     FOUND_BIN;
     for (;;) {
-        ST_STATS_BUMP_PROBE();
         bin = get_bin(tab->bins, get_size_ind(tab), ind);
         if (! EMPTY_OR_DELETED_BIN_P(bin)) {
             DO_PTR_EQUAL_CHECK(tab, &entries[bin - ENTRY_BASE], hash_value, key, eq_p, rebuilt_p);
@@ -1696,10 +1428,8 @@ find_table_entry_ind(st_table *tab, st_hash_t hash_value, st_data_t key)
             if (eq_p)
                 break;
         }
-        else if (EMPTY_BIN_P(bin)) {
-            ST_STATS_RECORD_PROBES(0);
+        else if (EMPTY_BIN_P(bin))
             return UNDEFINED_ENTRY_IND;
-        }
 #ifdef QUADRATIC_PROBE
         ind = hash_bin(ind + d, tab);
         d++;
@@ -1708,7 +1438,6 @@ find_table_entry_ind(st_table *tab, st_hash_t hash_value, st_data_t key)
 #endif
         COLLISION;
     }
-    ST_STATS_RECORD_PROBES(1);
     return bin;
 }
 
@@ -1728,7 +1457,6 @@ find_table_bin_ind(st_table *tab, st_hash_t hash_value, st_data_t key)
 #endif
     st_index_t bin;
     st_table_entry *entries = tab->entries;
-    ST_STATS_DECLARE_PROBE();
 
 #ifdef ST_USE_SWISS_BINS
     if (swiss_active_p(tab)) {
@@ -1738,7 +1466,6 @@ find_table_bin_ind(st_table *tab, st_hash_t hash_value, st_data_t key)
         st_index_t group_idx = st_swiss_first_group(tab, hash_value);
         st_index_t step = 0;
         for (;;) {
-            ST_STATS_BUMP_PROBE();
             swiss_group_t g = st_swiss_load_group(tab->ctrl + group_idx);
             swiss_match_t mh2 = st_swiss_match_byte(g, h2);
             while (st_swiss_match_any(mh2)) {
@@ -1754,17 +1481,13 @@ find_table_bin_ind(st_table *tab, st_hash_t hash_value, st_data_t key)
                                        hash_value, key, eq_p, rebuilt_p);
                     if (EXPECT(rebuilt_p, 0))
                         return REBUILT_TABLE_BIN_IND;
-                    if (eq_p) {
-                        ST_STATS_RECORD_PROBES(1);
+                    if (eq_p)
                         return cand_bin_ind;
-                    }
                 }
                 mh2 = st_swiss_match_drop(mh2);
             }
-            if (st_swiss_match_any(st_swiss_match_empty(g))) {
-                ST_STATS_RECORD_PROBES(0);
+            if (st_swiss_match_any(st_swiss_match_empty(g)))
                 return UNDEFINED_BIN_IND;
-            }
             step += ST_SWISS_GROUP_SIZE;
             group_idx = (group_idx + step) & mask;
         }
@@ -1779,7 +1502,6 @@ find_table_bin_ind(st_table *tab, st_hash_t hash_value, st_data_t key)
 #endif
     FOUND_BIN;
     for (;;) {
-        ST_STATS_BUMP_PROBE();
         bin = get_bin(tab->bins, get_size_ind(tab), ind);
         if (! EMPTY_OR_DELETED_BIN_P(bin)) {
             DO_PTR_EQUAL_CHECK(tab, &entries[bin - ENTRY_BASE], hash_value, key, eq_p, rebuilt_p);
@@ -1788,10 +1510,8 @@ find_table_bin_ind(st_table *tab, st_hash_t hash_value, st_data_t key)
             if (eq_p)
                 break;
         }
-        else if (EMPTY_BIN_P(bin)) {
-            ST_STATS_RECORD_PROBES(0);
+        else if (EMPTY_BIN_P(bin))
             return UNDEFINED_BIN_IND;
-        }
 #ifdef QUADRATIC_PROBE
         ind = hash_bin(ind + d, tab);
         d++;
@@ -1800,7 +1520,6 @@ find_table_bin_ind(st_table *tab, st_hash_t hash_value, st_data_t key)
 #endif
         COLLISION;
     }
-    ST_STATS_RECORD_PROBES(1);
     return ind;
 }
 
@@ -1817,7 +1536,6 @@ find_table_bin_ind_direct(st_table *tab, st_hash_t hash_value, st_data_t key)
     st_index_t perturb;
 #endif
     st_index_t bin;
-    ST_STATS_DECLARE_PROBE();
 
 #ifdef ST_USE_SWISS_BINS
     if (swiss_active_p(tab)) {
@@ -1828,14 +1546,10 @@ find_table_bin_ind_direct(st_table *tab, st_hash_t hash_value, st_data_t key)
         st_index_t group_idx = st_swiss_first_group(tab, hash_value);
         st_index_t step = 0;
         for (;;) {
-            ST_STATS_BUMP_PROBE();
             swiss_group_t g = st_swiss_load_group(tab->ctrl + group_idx);
             swiss_match_t mfree = st_swiss_match_free(g);
-            if (st_swiss_match_any(mfree)) {
-                int slot = st_swiss_match_first(mfree);
-                ST_STATS_RECORD_PROBES(0);
-                return group_idx + slot;
-            }
+            if (st_swiss_match_any(mfree))
+                return group_idx + st_swiss_match_first(mfree);
             step += ST_SWISS_GROUP_SIZE;
             group_idx = (group_idx + step) & mask;
         }
@@ -1850,12 +1564,9 @@ find_table_bin_ind_direct(st_table *tab, st_hash_t hash_value, st_data_t key)
 #endif
     FOUND_BIN;
     for (;;) {
-        ST_STATS_BUMP_PROBE();
         bin = get_bin(tab->bins, get_size_ind(tab), ind);
-        if (EMPTY_OR_DELETED_BIN_P(bin)) {
-            ST_STATS_RECORD_PROBES(0);
+        if (EMPTY_OR_DELETED_BIN_P(bin))
             return ind;
-        }
 #ifdef QUADRATIC_PROBE
         ind = hash_bin(ind + d, tab);
         d++;
@@ -1890,8 +1601,6 @@ find_table_bin_ptr_and_reserve(st_table *tab, st_hash_t *hash_value,
     st_index_t entry_index;
     st_index_t first_deleted_bin_ind;
     st_table_entry *entries;
-    int hit_p = 0;
-    ST_STATS_DECLARE_PROBE();
 
 #ifdef ST_USE_SWISS_BINS
     if (swiss_active_p(tab)) {
@@ -1903,7 +1612,6 @@ find_table_bin_ptr_and_reserve(st_table *tab, st_hash_t *hash_value,
         st_index_t swiss_first_deleted = UNDEFINED_BIN_IND;
         entries = tab->entries;
         for (;;) {
-            ST_STATS_BUMP_PROBE();
             swiss_group_t g = st_swiss_load_group(tab->ctrl + group_idx);
             /* First, scan for H2 matches and check keys. */
             swiss_match_t mh2 = st_swiss_match_byte(g, h2);
@@ -1921,7 +1629,6 @@ find_table_bin_ptr_and_reserve(st_table *tab, st_hash_t *hash_value,
                     if (EXPECT(rebuilt_p, 0))
                         return REBUILT_TABLE_ENTRY_IND;
                     if (eq_p) {
-                        ST_STATS_RECORD_PROBES(1);
                         *bin_ind = cand_bin_ind;
                         return cand_entry;
                     }
@@ -1939,7 +1646,6 @@ find_table_bin_ptr_and_reserve(st_table *tab, st_hash_t *hash_value,
             /* An empty byte means the key is not in the table: stop probing. */
             swiss_match_t mempty = st_swiss_match_empty(g);
             if (st_swiss_match_any(mempty)) {
-                ST_STATS_RECORD_PROBES(0);
                 tab->num_entries++;
                 if (swiss_first_deleted != UNDEFINED_BIN_IND) {
                     /* Reuse the earlier tombstone slot. MARK_BIN_EMPTY clears
@@ -1971,7 +1677,6 @@ find_table_bin_ptr_and_reserve(st_table *tab, st_hash_t *hash_value,
     first_deleted_bin_ind = UNDEFINED_BIN_IND;
     entries = tab->entries;
     for (;;) {
-        ST_STATS_BUMP_PROBE();
         entry_index = get_bin(tab->bins, get_size_ind(tab), ind);
         if (EMPTY_BIN_P(entry_index)) {
             tab->num_entries++;
@@ -1987,10 +1692,8 @@ find_table_bin_ptr_and_reserve(st_table *tab, st_hash_t *hash_value,
             DO_PTR_EQUAL_CHECK(tab, &entries[entry_index - ENTRY_BASE], curr_hash_value, key, eq_p, rebuilt_p);
             if (EXPECT(rebuilt_p, 0))
                 return REBUILT_TABLE_ENTRY_IND;
-            if (eq_p) {
-                hit_p = 1;
+            if (eq_p)
                 break;
-            }
         }
         else if (first_deleted_bin_ind == UNDEFINED_BIN_IND)
             first_deleted_bin_ind = ind;
@@ -2002,8 +1705,6 @@ find_table_bin_ptr_and_reserve(st_table *tab, st_hash_t *hash_value,
 #endif
         COLLISION;
     }
-    ST_STATS_RECORD_PROBES(hit_p);
-    (void)hit_p;
     *bin_ind = ind;
     return entry_index;
 }
@@ -2016,8 +1717,6 @@ st_lookup(st_table *tab, st_data_t key, st_data_t *value)
     st_index_t bin;
     st_hash_t hash = do_hash(key, tab);
 
-    ST_STATS_RECORD_OP(ST_STATS_OP_LOOKUP);
-    ST_STATS_RECORD_CALLSITE(ST_STATS_OP_LOOKUP);
  retry:
     if (tab->bins == NULL) {
         bin = find_entry(tab, hash, key);
@@ -2047,8 +1746,6 @@ st_get_key(st_table *tab, st_data_t key, st_data_t *result)
     st_index_t bin;
     st_hash_t hash = do_hash(key, tab);
 
-    ST_STATS_RECORD_OP(ST_STATS_OP_LOOKUP);
-    ST_STATS_RECORD_CALLSITE(ST_STATS_OP_LOOKUP);
  retry:
     if (tab->bins == NULL) {
         bin = find_entry(tab, hash, key);
@@ -2108,8 +1805,6 @@ st_insert(st_table *tab, st_data_t key, st_data_t value)
     st_index_t bin_ind;
     int new_p;
 
-    ST_STATS_RECORD_OP(ST_STATS_OP_INSERT);
-    ST_STATS_RECORD_CALLSITE(ST_STATS_OP_INSERT);
     hash_value = do_hash(key, tab);
  retry:
     rebuild_table_if_necessary(tab);
@@ -2204,8 +1899,6 @@ st_insert2(st_table *tab, st_data_t key, st_data_t value,
     st_index_t bin_ind;
     int new_p;
 
-    ST_STATS_RECORD_OP(ST_STATS_OP_INSERT);
-    ST_STATS_RECORD_CALLSITE(ST_STATS_OP_INSERT);
     hash_value = do_hash(key, tab);
  retry:
     rebuild_table_if_necessary (tab);
@@ -2385,8 +2078,6 @@ st_general_delete(st_table *tab, st_data_t *key, st_data_t *value)
 int
 st_delete(st_table *tab, st_data_t *key, st_data_t *value)
 {
-    ST_STATS_RECORD_OP(ST_STATS_OP_DELETE);
-    ST_STATS_RECORD_CALLSITE(ST_STATS_OP_DELETE);
     return st_general_delete(tab, key, value);
 }
 
@@ -2399,8 +2090,6 @@ int
 st_delete_safe(st_table *tab, st_data_t *key, st_data_t *value,
                st_data_t never ATTRIBUTE_UNUSED)
 {
-    ST_STATS_RECORD_OP(ST_STATS_OP_DELETE);
-    ST_STATS_RECORD_CALLSITE(ST_STATS_OP_DELETE);
     return st_general_delete(tab, key, value);
 }
 
@@ -2416,8 +2105,6 @@ st_shift(st_table *tab, st_data_t *key, st_data_t *value)
     st_table_entry *entries, *curr_entry_ptr;
     st_index_t bin_ind;
 
-    ST_STATS_RECORD_OP(ST_STATS_OP_OTHER);
-    ST_STATS_RECORD_CALLSITE(ST_STATS_OP_OTHER);
     entries = tab->entries;
     bound = tab->entries_bound;
     for (i = tab->entries_start; i < bound; i++) {
@@ -2484,9 +2171,6 @@ st_update(st_table *tab, st_data_t key,
     st_data_t value = 0, old_key;
     int retval, existing;
     st_hash_t hash = do_hash(key, tab);
-
-    ST_STATS_RECORD_OP(ST_STATS_OP_OTHER);
-    ST_STATS_RECORD_CALLSITE(ST_STATS_OP_OTHER);
 
  retry:
     entries = tab->entries;
