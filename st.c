@@ -1411,7 +1411,11 @@ find_table_entry_ind(st_table *tab, st_hash_t hash_value, st_data_t key)
 #ifdef QUADRATIC_PROBE
     d = 1;
 #else
-    perturb = hash_value;
+    /* Use the truncated 32-bit form of the hash so that the probe sequence
+     * matches the one driven by the stored hash during rebuild_table_with(),
+     * which only has the truncated value to work with after compact entries
+     * dropped the inline 64-bit hash field. */
+    perturb = ST_HASH32_FROM(hash_value);
 #endif
     FOUND_BIN;
     for (;;) {
@@ -1493,7 +1497,9 @@ find_table_bin_ind(st_table *tab, st_hash_t hash_value, st_data_t key)
 #ifdef QUADRATIC_PROBE
     d = 1;
 #else
-    perturb = hash_value;
+    /* See find_table_entry_ind: probe with the truncated hash so the
+     * sequence stays in sync with rebuild_table_with(). */
+    perturb = ST_HASH32_FROM(hash_value);
 #endif
     FOUND_BIN;
     for (;;) {
@@ -1555,7 +1561,8 @@ find_table_bin_ind_direct(st_table *tab, st_hash_t hash_value, st_data_t key)
 #ifdef QUADRATIC_PROBE
     d = 1;
 #else
-    perturb = hash_value;
+    /* Truncated to match the post-rebuild perturb sequence. */
+    perturb = ST_HASH32_FROM(hash_value);
 #endif
     FOUND_BIN;
     for (;;) {
