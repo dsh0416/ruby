@@ -1673,7 +1673,11 @@ find_table_bin_ptr_and_reserve(st_table *tab, st_hash_t *hash_value,
 #ifdef QUADRATIC_PROBE
     d = 1;
 #else
-    perturb = curr_hash_value;
+    /* Match the truncated probe sequence used by find_table_bin_ind /
+     * find_table_bin_ind_direct so insert and lookup stay in sync, and so
+     * post-rebuild placement (driven by the stored 32-bit hash) lines up
+     * with subsequent lookups. */
+    perturb = ST_HASH32_FROM(curr_hash_value);
 #endif
     FOUND_BIN;
     first_deleted_bin_ind = UNDEFINED_BIN_IND;
