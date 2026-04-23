@@ -135,12 +135,11 @@
 typedef st_index_t st_hash_t;
 
 /* When the Swiss-bins backend is enabled, st_table_entry is shrunk from
- * 24 B to 16 B by moving the per-entry hash into a parallel uint32_t array
- * (tab->hashes, declared in st_table). Storing only the low 32 bits is fine
- * for our needs: bin placement uses the full hash from do_hash() at probe
- * time, and the stored value is only used as a fast pre-filter before
- * EQUAL(). The 16 B layout doubles entries[]-per-cache-line density, which
- * profiling identified as the dominant remaining hot-path cost. */
+ * 24 B to 16 B by moving the per-entry hash into a parallel hashes[] array
+ * (tab->hashes, declared in st_table). Keeping the hash out-of-line preserves
+ * the tighter entries[] packing that improves cache density, while the stored
+ * full hash lets rebuild / foreach paths avoid recomputing from callback-
+ * owned keys. */
 #ifdef ST_USE_SWISS_BINS
 struct st_table_entry {
     st_data_t key;
@@ -201,22 +200,18 @@ static const struct st_hash_type type_strcasehash = {
 #define EQUAL(tab,x,y) ((x) == (y) || (*(tab)->type->compare)((x),(y)) == 0)
 
 /* Per-entry hash access. With the Swiss-bins backend, the hash lives in the
- * parallel tab->hashes[] array (one uint32_t per entry); without it, each
- * st_table_entry stores its own 64-bit hash inline. The macros below hide
- * the difference so the bulk of st.c is layout-agnostic. */
+ * parallel tab->hashes[] array; without it, each st_table_entry stores its
+ * own hash inline. The macros below hide the difference so the bulk of st.c
+ * is layout-agnostic. */
 #ifdef ST_USE_SWISS_BINS
-typedef uint32_t st_hash32_t;
-# define ST_RESERVED_HASH32_VAL ((st_hash32_t)0xFFFFFFFFu)
+# define ST_RESERVED_HASH32_VAL RESERVED_HASH_VAL
 # define ST_HASH_AT_PTR(tab, ptr) \
     ((tab)->hashes[(st_index_t)((ptr) - (tab)->entries)])
 # define ST_HASH_AT_IDX(tab, idx) ((tab)->hashes[(idx)])
-# define ST_HASH32_FROM(h) ((st_hash32_t)(h))
-/* For the compact-entry layout we keep the 32-bit hash check as a
- * cheap prefilter before EQUAL (which can be expensive for strings,
- * symbols, and other Object keys). It costs one extra load from a
- * different cache line, which is hidden by the prefetch issued at the
- * H2-match site and amortised when EQUAL would otherwise run a full
- * string compare. */
+# define ST_HASH32_FROM(h) (h)
+/* For the compact-entry layout we keep the hash in the parallel array so the
+ * Swiss H2 prefilter and the legacy perturb-chain path can both reuse it
+ * without touching key memory again. */
 # define PTR_EQUAL(tab, ptr, hash_val, key_) \
     (ST_HASH_AT_PTR((tab), (ptr)) == ST_HASH32_FROM(hash_val) \
      && EQUAL((tab), (key_), (ptr)->key))
@@ -256,7 +251,7 @@ typedef uint32_t st_hash32_t;
  * machinery further down. Below this entry_power, do not use the
  * Swiss-bins fast path. */
 #ifndef SWISS_MIN_ENTRY_POWER
-#define SWISS_MIN_ENTRY_POWER 5
+#define SWISS_MIN_ENTRY_POWER 6
 #endif
 #endif
 
@@ -391,14 +386,7 @@ static inline st_hash_t
 normalize_hash_value(st_hash_t hash)
 {
     /* RESERVED_HASH_VAL is used for a deleted entry.  Map it into
-       another value.  Such mapping should be extremely rare. With the
-       Swiss-bins layout the per-entry hash is truncated to its low 32 bits,
-       so we also nudge any hash whose low half happens to equal the 32-bit
-       reserved value off by one to avoid a tombstone aliasing collision. */
-#ifdef ST_USE_SWISS_BINS
-    if ((uint32_t)hash == 0xFFFFFFFFu)
-        return RESERVED_HASH_SUBSTITUTION_VAL;
-#endif
+       another value.  Such mapping should be extremely rare. */
     return hash == RESERVED_HASH_VAL ? RESERVED_HASH_SUBSTITUTION_VAL : hash;
 }
 
@@ -413,15 +401,8 @@ do_hash(st_data_t key, st_table *tab)
 static inline st_hash_t
 probe_hash(st_table *tab, st_data_t key, st_hash_t stored_hash)
 {
-#ifdef ST_USE_SWISS_BINS
-    /* The compact hashes[] array stores only the low 32 bits. That is
-     * enough for packed tables (which linearly scan entries[]) and for the
-     * Swiss ctrl[] path, but the legacy perturb chain still needs the full
-     * hash to reproduce its probe sequence after rebuilds. */
-    if (tab->ctrl == NULL && tab->bins != NULL) {
-        return do_hash(key, tab);
-    }
-#endif
+    (void)tab;
+    (void)key;
     return stored_hash;
 }
 
@@ -744,10 +725,9 @@ stat_col(void)
 #define ST_SWISS_CTRL_IS_EMPTY_OR_DELETED(c)  (((c) & (unsigned char)0x80) != 0)
 #define ST_SWISS_CTRL_IS_OCCUPIED(c)          (((c) & (unsigned char)0x80) == 0)
 
-/* H2 derivation: bits 25..31 of the hash. We deliberately stay within
- * the low 32 bits so that the parallel uint32_t hashes[] (see
- * include/ruby/st.h) can be used as-is during rebuild without having
- * to recompute the full 64-bit hash from the key. Bin selection
+/* H2 derivation: bits 25..31 of the hash. We stay above the low bin-index
+ * bits so H2 remains decorrelated from hash_bin(), and we can derive it
+ * directly from the stored hash without recomputing from the key. Bin selection
  * (hash_bin) uses bits 0..bin_power-1, so as long as bin_power <= 25
  * (32M bins) the H2 byte stays uncorrelated with the bin index. For
  * the rare giant tables beyond that threshold, the H2 prefilter loses
@@ -963,8 +943,8 @@ st_init_existing_table_with_size(st_table *tab, const struct st_hash_type *type,
     }
 #endif
 #ifdef ST_USE_SWISS_BINS
-    tab->hashes = (uint32_t *) malloc(get_allocated_entries(tab)
-                                      * sizeof(uint32_t));
+    tab->hashes = (st_hash_t *) malloc(get_allocated_entries(tab)
+                                       * sizeof(st_hash_t));
 #ifndef RUBY
     if (tab->hashes == NULL) {
         st_free_table(tab);
@@ -1104,7 +1084,7 @@ st_ctrl_memsize(const st_table *tab)
 static inline size_t
 st_hashes_memsize(const st_table *tab)
 {
-    return get_allocated_entries(tab) * sizeof(uint32_t);
+    return get_allocated_entries(tab) * sizeof(st_hash_t);
 }
 #endif
 
@@ -1972,14 +1952,14 @@ st_replace(st_table *new_tab, st_table *old_tab)
     }
 #endif
 #ifdef ST_USE_SWISS_BINS
-    new_tab->hashes = (uint32_t *) malloc(get_allocated_entries(old_tab)
-                                          * sizeof(uint32_t));
+    new_tab->hashes = (st_hash_t *) malloc(get_allocated_entries(old_tab)
+                                           * sizeof(st_hash_t));
 #ifndef RUBY
     if (new_tab->hashes == NULL) {
         return NULL;
     }
 #endif
-    MEMCPY(new_tab->hashes, old_tab->hashes, uint32_t,
+    MEMCPY(new_tab->hashes, old_tab->hashes, st_hash_t,
            get_allocated_entries(old_tab));
 #endif
     MEMCPY(new_tab->entries, old_tab->entries, st_table_entry,
@@ -2841,7 +2821,7 @@ st_expand_table(st_table *tab, st_index_t siz)
 #ifdef ST_USE_SWISS_BINS
     /* Carry the parallel hashes[] over too, otherwise PTR_EQUAL on the
      * expanded table would compare against zeroed-out hash slots. */
-    MEMCPY(tmp->hashes, tab->hashes, uint32_t, n);
+    MEMCPY(tmp->hashes, tab->hashes, st_hash_t, n);
 #endif
     st_free_bins(tab);
     st_free_entries(tab);

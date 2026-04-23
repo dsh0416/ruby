@@ -100,12 +100,11 @@ struct st_table {
      * Only allocated when entry_power >= SWISS_MIN_ENTRY_POWER; NULL otherwise.
      * The standard bins[] index layer is always allocated alongside it. */
     unsigned char *ctrl;
-    /* Parallel hash array for entries[]. Stores the low 32 bits of each
-     * entry's hash so that st_table_entry can shrink from 24 B to 16 B
-     * (key + record only). One word per entry, allocated in lockstep with
-     * entries[]. The reserved value 0xFFFFFFFF marks a tombstone, mirroring
-     * the legacy RESERVED_HASH_VAL convention. */
-    uint32_t *hashes;
+    /* Parallel hash array for entries[]. Stores the full hash so the compact
+     * st_table_entry can still avoid recomputing hashes during rebuilds,
+     * foreach deletion, and other paths that may outlive callback-owned key
+     * memory. One word per entry, allocated in lockstep with entries[]. */
+    st_index_t *hashes;
 #endif
 };
 
