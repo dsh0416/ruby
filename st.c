@@ -410,6 +410,20 @@ do_hash(st_data_t key, st_table *tab)
     return normalize_hash_value(hash);
 }
 
+static inline st_hash_t
+probe_hash(st_table *tab, st_data_t key, st_hash_t stored_hash)
+{
+#ifdef ST_USE_SWISS_BINS
+    /* The compact hashes[] array stores only the low 32 bits. That is
+     * enough when ctrl[] is active, but the legacy perturb chain depends on
+     * the full hash to reproduce the probe sequence after rebuilds. */
+    if (tab->ctrl == NULL) {
+        return do_hash(key, tab);
+    }
+#endif
+    return stored_hash;
+}
+
 /* Power of 2 defining the minimal number of allocated entries.  */
 #define MINIMAL_POWER2 2
 
@@ -1510,11 +1524,7 @@ rebuild_table_with(st_table *const new_tab, st_table *const tab)
         PREFETCH(entries + i + 1, 0);
         if (EXPECT(DELETED_ENTRY_P(tab, curr_entry_ptr), 0))
             continue;
-        /* The stored 32-bit hash is enough for hash_bin() (bin_power is
-         * almost always <= 25 in practice) and for st_swiss_h2() (we
-         * derive H2 from bits 25..31 -- see st_swiss_h2 above). No need
-         * to recompute via do_hash here. */
-        st_hash_t curr_hash = ST_HASH_AT_IDX(tab, i);
+        st_hash_t curr_hash = probe_hash(new_tab, curr_entry_ptr->key, ST_HASH_AT_IDX(tab, i));
         if (&new_entries[ni] != curr_entry_ptr)
             new_entries[ni] = *curr_entry_ptr;
         ST_HASH_AT_IDX(new_tab, ni) = ST_HASH32_FROM(curr_hash);
@@ -2414,12 +2424,7 @@ st_shift(st_table *tab, st_data_t *key, st_data_t *value)
         curr_entry_ptr = &entries[i];
         if (! DELETED_ENTRY_P(tab, curr_entry_ptr)) {
             st_data_t entry_key = curr_entry_ptr->key;
-            /* Recompute the full hash from the key. With the Swiss-bins
-             * layout the per-entry hash is truncated to 32 bits, which
-             * is sufficient for hash_bin() (bin_power <= 25 in
-             * practice) and for st_swiss_h2() since H2 lives in bits
-             * 25..31 of the 32-bit truncation. */
-            st_hash_t entry_hash = ST_HASH_AT_PTR(tab, curr_entry_ptr);
+            st_hash_t entry_hash = probe_hash(tab, entry_key, ST_HASH_AT_PTR(tab, curr_entry_ptr));
 
             if (value != 0) *value = curr_entry_ptr->record;
             *key = entry_key;
@@ -2564,7 +2569,6 @@ st_general_foreach(st_table *tab, st_foreach_check_callback_func *func, st_updat
     int error_p, packed_p = tab->bins == NULL;
 
     entries = tab->entries;
-    int hash_known = 0;
     /* The bound can change inside the loop even without rebuilding
        the table, e.g. by an entry insertion.  */
     for (i = tab->entries_start; i < tab->entries_bound; i++) {
@@ -2573,12 +2577,6 @@ st_general_foreach(st_table *tab, st_foreach_check_callback_func *func, st_updat
             continue;
         key = curr_entry_ptr->key;
         rebuilds_num = tab->rebuilds_num;
-        /* Capture the per-entry hash up front so the post-rebuild and
-         * ST_DELETE branches can reuse it without calling do_hash() on
-         * the key again. The 32-bit truncation is fine for both
-         * hash_bin() and st_swiss_h2() (see comment on st_swiss_h2). */
-        hash = ST_HASH_AT_PTR(tab, curr_entry_ptr);
-        hash_known = 1;
         retval = (*func)(key, curr_entry_ptr->record, arg, 0);
 
         if (retval == ST_REPLACE && replace) {
@@ -2590,10 +2588,9 @@ st_general_foreach(st_table *tab, st_foreach_check_callback_func *func, st_updat
         }
 
         if (rebuilds_num != tab->rebuilds_num) {
+            hash = do_hash(key, tab);
             /* The callback caused a rebuild; entries[] indices may have
-             * shifted, but `hash` (captured above from the parallel
-             * hashes[] array) is still the correct value for `key`
-             * since do_hash is deterministic. Re-find by hash + key. */
+             * shifted, so re-find by hash + key. */
         retry:
             entries = tab->entries;
             packed_p = tab->bins == NULL;
@@ -2629,7 +2626,7 @@ st_general_foreach(st_table *tab, st_foreach_check_callback_func *func, st_updat
             return 0;
           case ST_DELETE: {
             st_data_t key = curr_entry_ptr->key;
-            /* hash was captured from hashes[] at the top of the loop. */
+            hash = probe_hash(tab, key, ST_HASH_AT_PTR(tab, curr_entry_ptr));
 
               again:
             if (packed_p) {
@@ -2657,7 +2654,6 @@ st_general_foreach(st_table *tab, st_foreach_check_callback_func *func, st_updat
         }
     }
     (void)hash;
-    (void)hash_known;
     return 0;
 }
 
@@ -3251,10 +3247,7 @@ st_rehash_indexed(st_table *tab)
         if (DELETED_ENTRY_P(tab, p))
             continue;
 
-        /* The stored 32-bit hash is sufficient for hash_bin() and for
-         * st_swiss_h2() (see comment on st_swiss_h2). No need to call
-         * do_hash again. */
-        st_hash_t fresh = ST_HASH_AT_IDX(tab, i);
+        st_hash_t fresh = probe_hash(tab, p->key, ST_HASH_AT_IDX(tab, i));
 #ifdef QUADRATIC_PROBE
         st_index_t d = 1;
 #else
