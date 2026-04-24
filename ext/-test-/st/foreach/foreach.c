@@ -342,57 +342,62 @@ moving_foreach_i(st_data_t key, st_data_t val, st_data_t arg)
 static VALUE
 foreach_moves_keys_and_updates_values(VALUE self)
 {
-    const st_index_t key_count = 129;
-    st_table *tbl = st_init_numtable_with_size(key_count);
-    struct moving_foreach_state state;
-    st_index_t i;
+    static const st_index_t key_counts[] = {27, 111};
+    size_t scenario;
 
     (void)self;
 
-    for (i = 0; i < key_count; i++) {
-        st_insert(tbl, i, i * 10);
-    }
+    for (scenario = 0; scenario < sizeof(key_counts) / sizeof(key_counts[0]); scenario++) {
+        const st_index_t key_count = key_counts[scenario];
+        st_table *tbl = st_init_numtable_with_size(key_count);
+        struct moving_foreach_state state;
+        st_index_t i;
 
-    state.tbl = tbl;
-    state.key_count = key_count;
-    state.seen = 0;
-    st_foreach(tbl, moving_foreach_i, (st_data_t)&state);
+        for (i = 0; i < key_count; i++) {
+            st_insert(tbl, i, i * 10);
+        }
 
-    for (i = 0; i < key_count; i++) {
-        st_data_t value;
-        if ((i & 1) == 0) {
-            if (!st_lookup(tbl, i, &value) || value != i * 10 + 1) {
-                rb_bug("missing updated even entry");
+        state.tbl = tbl;
+        state.key_count = key_count;
+        state.seen = 0;
+        st_foreach(tbl, moving_foreach_i, (st_data_t)&state);
+
+        for (i = 0; i < key_count; i++) {
+            st_data_t value;
+            if ((i & 1) == 0) {
+                if (!st_lookup(tbl, i, &value) || value != i * 10 + 1) {
+                    rb_bug("missing updated even entry");
+                }
+            }
+            else {
+                st_data_t old_value;
+                if (st_lookup(tbl, i, &old_value)) {
+                    rb_bug("stale odd entry was not deleted");
+                }
+                if (!st_lookup(tbl, i + 1000001, &value) || value != i * 10 + 2) {
+                    rb_bug("missing moved odd entry");
+                }
             }
         }
-        else {
-            st_data_t old_value;
-            if (st_lookup(tbl, i, &old_value)) {
-                rb_bug("stale odd entry was not deleted");
-            }
-            if (!st_lookup(tbl, i + 1000001, &value) || value != i * 10 + 2) {
-                rb_bug("missing moved odd entry");
+
+        if (tbl->num_entries != key_count) {
+            rb_bug("unexpected entry count after foreach move/update");
+        }
+
+        for (i = 0; i < key_count; i++) {
+            st_data_t key = (i & 1) == 0 ? i : i + 1000001;
+            st_data_t deleted = 0;
+            if (!st_delete(tbl, &key, &deleted)) {
+                rb_bug("failed to delete post-foreach key");
             }
         }
-    }
 
-    if (tbl->num_entries != key_count) {
-        rb_bug("unexpected entry count after foreach move/update");
-    }
-
-    for (i = 0; i < key_count; i++) {
-        st_data_t key = (i & 1) == 0 ? i : i + 1000001;
-        st_data_t deleted = 0;
-        if (!st_delete(tbl, &key, &deleted)) {
-            rb_bug("failed to delete post-foreach key");
+        if (tbl->num_entries != 0) {
+            rb_bug("table not empty after deleting moved/update entries");
         }
-    }
 
-    if (tbl->num_entries != 0) {
-        rb_bug("table not empty after deleting moved/update entries");
+        st_free_table(tbl);
     }
-
-    st_free_table(tbl);
     return Qtrue;
 }
 
