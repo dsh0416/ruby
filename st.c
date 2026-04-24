@@ -729,6 +729,15 @@ st_swiss_next_group(st_index_t ind, st_table *tab)
 {
     return (ind + ST_SWISS_GROUP_SIZE) & bins_mask(tab);
 }
+
+typedef struct {
+    st_index_t bin_ind;
+    st_index_t entry_ind;
+    st_index_t first_deleted_bin_ind;
+    bool found;
+    bool rebuilt;
+    bool found_empty;
+} st_swiss_probe_result_t;
 #else
 #define ST_GET_TABLE_BIN(tab, ind) get_bin((tab)->bins, get_size_ind(tab), (ind))
 #define ST_SET_TABLE_BIN(tab, ind, bin) set_bin((tab)->bins, get_size_ind(tab), (ind), (bin))
@@ -750,6 +759,18 @@ st_table_rebuild_bound(const st_table *tab)
 #endif
     return get_allocated_entries(tab);
 }
+
+#if ST_USE_SWISS_BINS
+static inline bool
+st_swiss_tombstone_rebuild_p(const st_table *tab, st_index_t bound)
+{
+    st_index_t half_bound = bound / 2 + (bound & 1);
+
+    return tab->bins != NULL
+        && tab->bin_power > MAX_POWER2_FOR_TABLES_WITHOUT_BINS
+        && tab->num_entries < half_bound;
+}
+#endif
 
 /* Mark all bins of table TAB as empty.  */
 static void
@@ -1086,6 +1107,77 @@ count_collision(const struct st_hash_type *type)
 #define FOUND_BIN
 #endif
 
+#if ST_USE_SWISS_BINS
+static st_swiss_probe_result_t
+st_swiss_probe(st_table *tab, st_hash_t hash_value, st_data_t key, bool reserve)
+{
+    int eq_p, rebuilt_p;
+    st_index_t ind;
+    unsigned char h2 = st_swiss_h2(hash_value);
+    st_table_entry *entries = tab->entries;
+    st_stored_hash_t *hashes = st_hashes_ptr(tab);
+    st_swiss_probe_result_t result = {
+        UNDEFINED_BIN_IND,
+        UNDEFINED_ENTRY_IND,
+        UNDEFINED_BIN_IND,
+        false,
+        false,
+        false,
+    };
+
+    ind = st_swiss_group_start(hash_value, tab);
+    FOUND_BIN;
+    for (;;) {
+        uint64_t group = st_swiss_ctrl_group(tab, ind);
+        uint64_t candidates = st_swiss_match_byte(group, h2);
+
+        if (EXPECT(candidates != 0, 1)) do {
+            st_index_t bin_ind = ind + (ntz_int64(candidates) >> 3);
+            st_index_t bin = st_swiss_get_bin(tab, bin_ind);
+            if (EXPECT(!EMPTY_OR_DELETED_BIN_P(bin), 1)) {
+                st_index_t entry_ind = bin - ENTRY_BASE;
+                PREFETCH(&entries[entry_ind], 0);
+                PREFETCH(&hashes[entry_ind], 0);
+                DO_PTR_EQUAL_CHECK(tab, &entries[entry_ind], hash_value, key, eq_p, rebuilt_p);
+                if (EXPECT(rebuilt_p, 0)) {
+                    result.rebuilt = true;
+                    return result;
+                }
+                if (EXPECT(eq_p, 1)) {
+                    result.bin_ind = bin_ind;
+                    result.entry_ind = entry_ind;
+                    result.found = true;
+                    assert(!EMPTY_OR_DELETED_BIN_P(bin));
+                    return result;
+                }
+            }
+            candidates &= candidates - 1;
+        } while (candidates != 0);
+
+        if (reserve) {
+            uint64_t deleted = st_swiss_match_byte(group, ST_CTRL_DELETED);
+            if (result.first_deleted_bin_ind == UNDEFINED_BIN_IND && deleted != 0)
+                result.first_deleted_bin_ind = ind + (ntz_int64(deleted) >> 3);
+        }
+
+        {
+            uint64_t empty = st_swiss_match_byte(group, ST_CTRL_EMPTY);
+            if (EXPECT(empty != 0, 0)) {
+                result.found_empty = true;
+                result.bin_ind = ind + (ntz_int64(empty) >> 3);
+                if (reserve && result.first_deleted_bin_ind != UNDEFINED_BIN_IND)
+                    result.bin_ind = result.first_deleted_bin_ind;
+                assert(!reserve || result.bin_ind != UNDEFINED_BIN_IND);
+                return result;
+            }
+        }
+
+        ind = st_swiss_next_group(ind, tab);
+        COLLISION;
+    }
+}
+#endif
+
 /* If the number of entries in the table is at least REBUILD_THRESHOLD
    times less than the entry array length, decrease the table
    size.  */
@@ -1253,40 +1345,13 @@ static st_index_t
 find_table_entry_ind(st_table *tab, st_hash_t hash_value, st_data_t key)
 {
 #if ST_USE_SWISS_BINS
-    int eq_p, rebuilt_p;
-    st_index_t ind;
-    st_index_t bin;
-    unsigned char h2 = st_swiss_h2(hash_value);
-    st_table_entry *entries = tab->entries;
-    st_stored_hash_t *hashes = st_hashes_ptr(tab);
-
-    ind = st_swiss_group_start(hash_value, tab);
-    FOUND_BIN;
-    for (;;) {
-        uint64_t group = st_swiss_ctrl_group(tab, ind);
-        uint64_t candidates = st_swiss_match_byte(group, h2);
-
-        if (EXPECT(candidates != 0, 1)) do {
-            st_index_t bin_ind = ind + (ntz_int64(candidates) >> 3);
-            st_index_t entry_ind;
-            bin = st_swiss_get_bin(tab, bin_ind);
-            if (EXPECT(!EMPTY_OR_DELETED_BIN_P(bin), 1)) {
-                entry_ind = bin - ENTRY_BASE;
-                PREFETCH(&entries[entry_ind], 0);
-                PREFETCH(&hashes[entry_ind], 0);
-                DO_PTR_EQUAL_CHECK(tab, &entries[entry_ind], hash_value, key, eq_p, rebuilt_p);
-                if (EXPECT(rebuilt_p, 0))
-                    return REBUILT_TABLE_ENTRY_IND;
-                if (EXPECT(eq_p, 1))
-                    return bin;
-            }
-            candidates &= candidates - 1;
-        } while (candidates != 0);
-        if (EXPECT(st_swiss_match_byte(group, ST_CTRL_EMPTY) != 0, 0))
-            return UNDEFINED_ENTRY_IND;
-        ind = st_swiss_next_group(ind, tab);
-        COLLISION;
-    }
+    st_swiss_probe_result_t result = st_swiss_probe(tab, hash_value, key, false);
+    if (EXPECT(result.rebuilt, 0))
+        return REBUILT_TABLE_ENTRY_IND;
+    if (!result.found)
+        return UNDEFINED_ENTRY_IND;
+    assert(result.entry_ind != UNDEFINED_ENTRY_IND);
+    return result.entry_ind + ENTRY_BASE;
 #else
     int eq_p, rebuilt_p;
     st_index_t ind;
@@ -1336,38 +1401,13 @@ static st_index_t
 find_table_bin_ind(st_table *tab, st_hash_t hash_value, st_data_t key)
 {
 #if ST_USE_SWISS_BINS
-    int eq_p, rebuilt_p;
-    st_index_t ind;
-    unsigned char h2 = st_swiss_h2(hash_value);
-    st_table_entry *entries = tab->entries;
-    st_stored_hash_t *hashes = st_hashes_ptr(tab);
-
-    ind = st_swiss_group_start(hash_value, tab);
-    FOUND_BIN;
-    for (;;) {
-        uint64_t group = st_swiss_ctrl_group(tab, ind);
-        uint64_t candidates = st_swiss_match_byte(group, h2);
-
-        if (EXPECT(candidates != 0, 1)) do {
-            st_index_t bin_ind = ind + (ntz_int64(candidates) >> 3);
-            st_index_t bin = st_swiss_get_bin(tab, bin_ind);
-            if (EXPECT(!EMPTY_OR_DELETED_BIN_P(bin), 1)) {
-                st_index_t entry_ind = bin - ENTRY_BASE;
-                PREFETCH(&entries[entry_ind], 0);
-                PREFETCH(&hashes[entry_ind], 0);
-                DO_PTR_EQUAL_CHECK(tab, &entries[entry_ind], hash_value, key, eq_p, rebuilt_p);
-                if (EXPECT(rebuilt_p, 0))
-                    return REBUILT_TABLE_BIN_IND;
-                if (EXPECT(eq_p, 1))
-                    return bin_ind;
-            }
-            candidates &= candidates - 1;
-        } while (candidates != 0);
-        if (EXPECT(st_swiss_match_byte(group, ST_CTRL_EMPTY) != 0, 0))
-            return UNDEFINED_BIN_IND;
-        ind = st_swiss_next_group(ind, tab);
-        COLLISION;
-    }
+    st_swiss_probe_result_t result = st_swiss_probe(tab, hash_value, key, false);
+    if (EXPECT(result.rebuilt, 0))
+        return REBUILT_TABLE_BIN_IND;
+    if (!result.found)
+        return UNDEFINED_BIN_IND;
+    assert(result.bin_ind != UNDEFINED_BIN_IND);
+    return result.bin_ind;
 #else
     int eq_p, rebuilt_p;
     st_index_t ind;
@@ -1466,8 +1506,9 @@ find_table_bin_ind_direct(st_table *tab, st_hash_t hash_value, st_data_t key)
    bin for inclusion of the corresponding entry into the table if it
    is not there yet.  We always find such bin as bins array length is
    bigger entries array.  Although we can reuse a deleted bin, the
-   result bin value is always empty if the table has no entry with
-   KEY.  Return the entries array index of the found entry or
+   non-Swiss result bin value is always empty if the table has no entry
+   with KEY.  Swiss bins may return a deleted bin for immediate overwrite.
+   Return the entries array index of the found entry or
    UNDEFINED_ENTRY_IND if it is not found.  If the table was rebuilt
    during the search, return REBUILT_TABLE_ENTRY_IND.  */
 static st_index_t
@@ -1475,56 +1516,18 @@ find_table_bin_ptr_and_reserve(st_table *tab, st_hash_t *hash_value,
                                st_data_t key, st_index_t *bin_ind)
 {
 #if ST_USE_SWISS_BINS
-    int eq_p, rebuilt_p;
-    st_index_t ind;
-    st_hash_t curr_hash_value = *hash_value;
-    st_index_t first_deleted_bin_ind = UNDEFINED_BIN_IND;
-    unsigned char h2 = st_swiss_h2(curr_hash_value);
-    st_table_entry *entries = tab->entries;
-    st_stored_hash_t *hashes = st_hashes_ptr(tab);
-
-    ind = st_swiss_group_start(curr_hash_value, tab);
-    FOUND_BIN;
-    for (;;) {
-        uint64_t group = st_swiss_ctrl_group(tab, ind);
-        uint64_t candidates = st_swiss_match_byte(group, h2);
-        uint64_t deleted = st_swiss_match_byte(group, ST_CTRL_DELETED);
-        uint64_t empty = st_swiss_match_byte(group, ST_CTRL_EMPTY);
-
-        if (EXPECT(candidates != 0, 1)) do {
-            st_index_t curr_bin_ind = ind + (ntz_int64(candidates) >> 3);
-            st_index_t entry_index = st_swiss_get_bin(tab, curr_bin_ind);
-            if (EXPECT(!EMPTY_OR_DELETED_BIN_P(entry_index), 1)) {
-                st_index_t entry_ind = entry_index - ENTRY_BASE;
-                PREFETCH(&entries[entry_ind], 0);
-                PREFETCH(&hashes[entry_ind], 0);
-                DO_PTR_EQUAL_CHECK(tab, &entries[entry_ind], curr_hash_value, key, eq_p, rebuilt_p);
-                if (EXPECT(rebuilt_p, 0))
-                    return REBUILT_TABLE_ENTRY_IND;
-                if (EXPECT(eq_p, 1)) {
-                    *bin_ind = curr_bin_ind;
-                    return entry_index;
-                }
-            }
-            candidates &= candidates - 1;
-        } while (candidates != 0);
-        if (first_deleted_bin_ind == UNDEFINED_BIN_IND && deleted != 0)
-            first_deleted_bin_ind = ind + (ntz_int64(deleted) >> 3);
-        if (EXPECT(empty != 0, 0)) {
-            tab->num_entries++;
-            if (first_deleted_bin_ind != UNDEFINED_BIN_IND) {
-                ind = first_deleted_bin_ind;
-                MARK_BIN_EMPTY(tab, ind);
-            }
-            else {
-                ind += ntz_int64(empty) >> 3;
-            }
-            *bin_ind = ind;
-            return UNDEFINED_ENTRY_IND;
-        }
-        ind = st_swiss_next_group(ind, tab);
-        COLLISION;
+    st_swiss_probe_result_t result = st_swiss_probe(tab, *hash_value, key, true);
+    if (EXPECT(result.rebuilt, 0))
+        return REBUILT_TABLE_ENTRY_IND;
+    *bin_ind = result.bin_ind;
+    if (result.found) {
+        assert(result.entry_ind != UNDEFINED_ENTRY_IND);
+        return result.entry_ind + ENTRY_BASE;
     }
+    assert(result.found_empty);
+    assert(*bin_ind != UNDEFINED_BIN_IND);
+    tab->num_entries++;
+    return UNDEFINED_ENTRY_IND;
 #else
     int eq_p, rebuilt_p;
     st_index_t ind;
@@ -1645,7 +1648,11 @@ rebuild_table_if_necessary (st_table *tab)
 {
     st_index_t bound = tab->entries_bound;
 
-    if (bound >= st_table_rebuild_bound(tab))
+    if (bound >= st_table_rebuild_bound(tab)
+#if ST_USE_SWISS_BINS
+        || st_swiss_tombstone_rebuild_p(tab, bound)
+#endif
+        )
         rebuild_table(tab);
 }
 
