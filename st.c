@@ -1131,19 +1131,19 @@ st_swiss_probe(st_table *tab, st_hash_t hash_value, st_data_t key, bool reserve)
         uint64_t group = st_swiss_ctrl_group(tab, ind);
         uint64_t candidates = st_swiss_match_byte(group, h2);
 
-        if (EXPECT(candidates != 0, 1)) do {
+        if (candidates != 0) do {
             st_index_t bin_ind = ind + (ntz_int64(candidates) >> 3);
             st_index_t bin = st_swiss_get_bin(tab, bin_ind);
-            if (EXPECT(!EMPTY_OR_DELETED_BIN_P(bin), 1)) {
+            if (!EMPTY_OR_DELETED_BIN_P(bin)) {
                 st_index_t entry_ind = bin - ENTRY_BASE;
                 PREFETCH(&entries[entry_ind], 0);
                 PREFETCH(&hashes[entry_ind], 0);
                 DO_PTR_EQUAL_CHECK(tab, &entries[entry_ind], hash_value, key, eq_p, rebuilt_p);
-                if (EXPECT(rebuilt_p, 0)) {
+                if (rebuilt_p) {
                     result.rebuilt = true;
                     return result;
                 }
-                if (EXPECT(eq_p, 1)) {
+                if (eq_p) {
                     result.bin_ind = bin_ind;
                     result.entry_ind = entry_ind;
                     result.found = true;
@@ -1162,7 +1162,7 @@ st_swiss_probe(st_table *tab, st_hash_t hash_value, st_data_t key, bool reserve)
 
         {
             uint64_t empty = st_swiss_match_byte(group, ST_CTRL_EMPTY);
-            if (EXPECT(empty != 0, 0)) {
+            if (empty != 0) {
                 result.found_empty = true;
                 result.bin_ind = ind + (ntz_int64(empty) >> 3);
                 if (reserve && result.first_deleted_bin_ind != UNDEFINED_BIN_IND)
