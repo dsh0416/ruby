@@ -308,6 +308,82 @@ foreach_keeps_stored_hash(VALUE self)
 }
 #endif
 
+struct moving_foreach_state {
+    st_table *tbl;
+    st_index_t key_count;
+    st_index_t seen;
+};
+
+static int
+moving_foreach_i(st_data_t key, st_data_t val, st_data_t arg)
+{
+    struct moving_foreach_state *state = (struct moving_foreach_state *)arg;
+
+    state->seen++;
+    if (state->seen > state->key_count * 3) {
+        rb_bug("st_foreach move/update loop did not terminate");
+    }
+
+    if ((key & 1) == 0) {
+        if (!st_insert(state->tbl, key, val + 1)) {
+            rb_bug("expected in-place update for existing key");
+        }
+        return ST_CONTINUE;
+    }
+    else {
+        st_data_t new_key = key + 1000001;
+        if (st_insert(state->tbl, new_key, val + 1)) {
+            rb_bug("unexpected pre-existing moved key");
+        }
+        return ST_DELETE;
+    }
+}
+
+static VALUE
+foreach_moves_keys_and_updates_values(VALUE self)
+{
+    const st_index_t key_count = 129;
+    st_table *tbl = st_init_numtable_with_size(key_count);
+    struct moving_foreach_state state;
+    st_index_t i;
+
+    (void)self;
+
+    for (i = 0; i < key_count; i++) {
+        st_insert(tbl, i, i * 10);
+    }
+
+    state.tbl = tbl;
+    state.key_count = key_count;
+    state.seen = 0;
+    st_foreach(tbl, moving_foreach_i, (st_data_t)&state);
+
+    for (i = 0; i < key_count; i++) {
+        st_data_t value;
+        if ((i & 1) == 0) {
+            if (!st_lookup(tbl, i, &value) || value != i * 10 + 1) {
+                rb_bug("missing updated even entry");
+            }
+        }
+        else {
+            st_data_t old_value;
+            if (st_lookup(tbl, i, &old_value)) {
+                rb_bug("stale odd entry was not deleted");
+            }
+            if (!st_lookup(tbl, i + 1000001, &value) || value != i * 10 + 2) {
+                rb_bug("missing moved odd entry");
+            }
+        }
+    }
+
+    if (tbl->num_entries != key_count) {
+        rb_bug("unexpected entry count after foreach move/update");
+    }
+
+    st_free_table(tbl);
+    return Qtrue;
+}
+
 void
 Init_foreach(void)
 {
@@ -315,4 +391,5 @@ Init_foreach(void)
     rb_define_singleton_method(bug, "unp_st_foreach_check", unp_fec, 1);
     rb_define_singleton_method(bug, "unp_st_foreach", unp_fe, 1);
     rb_define_singleton_method(bug, "st_foreach_keeps_stored_hash", foreach_keeps_stored_hash, 0);
+    rb_define_singleton_method(bug, "st_foreach_moves_keys_and_updates_values", foreach_moves_keys_and_updates_values, 0);
 }
