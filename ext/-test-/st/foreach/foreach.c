@@ -380,6 +380,18 @@ foreach_moves_keys_and_updates_values(VALUE self)
         rb_bug("unexpected entry count after foreach move/update");
     }
 
+    for (i = 0; i < key_count; i++) {
+        st_data_t key = (i & 1) == 0 ? i : i + 1000001;
+        st_data_t deleted = 0;
+        if (!st_delete(tbl, &key, &deleted)) {
+            rb_bug("failed to delete post-foreach key");
+        }
+    }
+
+    if (tbl->num_entries != 0) {
+        rb_bug("table not empty after deleting moved/update entries");
+    }
+
     st_free_table(tbl);
     return Qtrue;
 }
