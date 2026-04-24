@@ -1111,7 +1111,7 @@ count_collision(const struct st_hash_type *type)
 static st_swiss_probe_result_t
 st_swiss_probe(st_table *tab, st_hash_t hash_value, st_data_t key, bool reserve)
 {
-    int eq_p, rebuilt_p;
+    int eq_p;
     st_index_t ind;
     unsigned char h2 = st_swiss_h2(hash_value);
     st_table_entry *entries = tab->entries;
@@ -1134,12 +1134,12 @@ st_swiss_probe(st_table *tab, st_hash_t hash_value, st_data_t key, bool reserve)
         if (candidates != 0) do {
             st_index_t bin_ind = ind + (ntz_int64(candidates) >> 3);
             st_index_t bin = st_swiss_get_bin(tab, bin_ind);
-            if (!EMPTY_OR_DELETED_BIN_P(bin)) {
-                st_index_t entry_ind = bin - ENTRY_BASE;
-                PREFETCH(&entries[entry_ind], 0);
-                PREFETCH(&hashes[entry_ind], 0);
-                DO_PTR_EQUAL_CHECK(tab, &entries[entry_ind], hash_value, key, eq_p, rebuilt_p);
-                if (rebuilt_p) {
+            st_index_t entry_ind = bin - ENTRY_BASE;
+
+            if ((st_hash_t)hashes[entry_ind] == hash_value) {
+                unsigned int old_rebuilds_num = tab->rebuilds_num;
+                eq_p = EQUAL(tab, key, entries[entry_ind].key);
+                if (old_rebuilds_num != tab->rebuilds_num) {
                     result.rebuilt = true;
                     return result;
                 }
@@ -1147,7 +1147,6 @@ st_swiss_probe(st_table *tab, st_hash_t hash_value, st_data_t key, bool reserve)
                     result.bin_ind = bin_ind;
                     result.entry_ind = entry_ind;
                     result.found = true;
-                    assert(!EMPTY_OR_DELETED_BIN_P(bin));
                     return result;
                 }
             }
