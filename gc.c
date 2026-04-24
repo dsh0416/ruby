@@ -4144,6 +4144,7 @@ vm_weak_table_gen_fields_foreach(st_data_t key, st_data_t value, st_data_t data)
       case ST_REPLACE: {
         ret = iter_data->update_callback(&new_key, iter_data->data);
         if (key != new_key) {
+            RBASIC_SET_SHAPE_ID((VALUE)key, ROOT_SHAPE_ID);
             ret = ST_DELETE;
         }
         break;
