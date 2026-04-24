@@ -1111,11 +1111,10 @@ count_collision(const struct st_hash_type *type)
 static st_swiss_probe_result_t
 st_swiss_probe(st_table *tab, st_hash_t hash_value, st_data_t key, bool reserve)
 {
-    int eq_p;
+    int eq_p, rebuilt_p;
     st_index_t ind;
     unsigned char h2 = st_swiss_h2(hash_value);
     st_table_entry *entries = tab->entries;
-    st_stored_hash_t *hashes = st_hashes_ptr(tab);
     st_swiss_probe_result_t result = {
         UNDEFINED_BIN_IND,
         UNDEFINED_ENTRY_IND,
@@ -1136,19 +1135,16 @@ st_swiss_probe(st_table *tab, st_hash_t hash_value, st_data_t key, bool reserve)
             st_index_t bin = st_swiss_get_bin(tab, bin_ind);
             st_index_t entry_ind = bin - ENTRY_BASE;
 
-            if (tab->type == &st_hashtype_num || (st_hash_t)hashes[entry_ind] == hash_value) {
-                unsigned int old_rebuilds_num = tab->rebuilds_num;
-                eq_p = EQUAL(tab, key, entries[entry_ind].key);
-                if (old_rebuilds_num != tab->rebuilds_num) {
-                    result.rebuilt = true;
-                    return result;
-                }
-                if (eq_p) {
-                    result.bin_ind = bin_ind;
-                    result.entry_ind = entry_ind;
-                    result.found = true;
-                    return result;
-                }
+            DO_PTR_EQUAL_CHECK(tab, &entries[entry_ind], hash_value, key, eq_p, rebuilt_p);
+            if (rebuilt_p) {
+                result.rebuilt = true;
+                return result;
+            }
+            if (eq_p) {
+                result.bin_ind = bin_ind;
+                result.entry_ind = entry_ind;
+                result.found = true;
+                return result;
             }
             candidates &= candidates - 1;
         } while (candidates != 0);
