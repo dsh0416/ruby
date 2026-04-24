@@ -3105,7 +3105,7 @@ st_rehash_indexed(st_table *tab)
 #ifdef QUADRATIC_PROBE
         st_index_t d = 1;
 #else
-        st_index_t perturb = fresh;
+        st_index_t perturb = st_hash_cmp_value(tab, fresh);
 #endif
 
         ind = hash_bin(fresh, tab);
@@ -3127,7 +3127,7 @@ st_rehash_indexed(st_table *tab)
                     ENTRY_SET_RECORD(tab, q, ENTRY_RECORD(tab, p));
                     MARK_ENTRY_DELETED(tab, p);
                     tab->num_entries--;
-                    update_range_for_deleted(tab, bin);
+                    update_range_for_deleted(tab, i);
                     break;
                 }
                 else {
