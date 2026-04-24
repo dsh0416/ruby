@@ -1136,7 +1136,7 @@ st_swiss_probe(st_table *tab, st_hash_t hash_value, st_data_t key, bool reserve)
             st_index_t bin = st_swiss_get_bin(tab, bin_ind);
             st_index_t entry_ind = bin - ENTRY_BASE;
 
-            if ((st_hash_t)hashes[entry_ind] == hash_value) {
+            if (tab->type == &st_hashtype_num || (st_hash_t)hashes[entry_ind] == hash_value) {
                 unsigned int old_rebuilds_num = tab->rebuilds_num;
                 eq_p = EQUAL(tab, key, entries[entry_ind].key);
                 if (old_rebuilds_num != tab->rebuilds_num) {
