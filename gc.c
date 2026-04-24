@@ -4043,6 +4043,7 @@ struct global_vm_table_foreach_data {
     vm_table_update_callback_func update_callback;
     void *data;
     bool weak_only;
+    st_table *generic_fields_pending_updates;
 };
 
 static int
@@ -4124,6 +4125,13 @@ vm_weak_table_id2ref_foreach_update(st_data_t *key, st_data_t *value, st_data_t 
 }
 
 static int
+st_insert_generic_fields_i(st_data_t key, st_data_t value, st_data_t arg)
+{
+    st_insert((st_table *)arg, key, value);
+    return ST_CONTINUE;
+}
+
+static int
 vm_weak_table_gen_fields_foreach(st_data_t key, st_data_t value, st_data_t data)
 {
     struct global_vm_table_foreach_data *iter_data = (struct global_vm_table_foreach_data *)data;
@@ -4170,11 +4178,8 @@ vm_weak_table_gen_fields_foreach(st_data_t key, st_data_t value, st_data_t data)
     }
 
     if (key != new_key || value != new_value) {
-        DURING_GC_COULD_MALLOC_REGION_START();
-        {
-            st_insert(rb_generic_fields_tbl_get(), (st_data_t)new_key, new_value);
-        }
-        DURING_GC_COULD_MALLOC_REGION_END();
+        RUBY_ASSERT(iter_data->generic_fields_pending_updates != NULL);
+        st_insert(iter_data->generic_fields_pending_updates, (st_data_t)new_key, new_value);
     }
 
     return ret;
@@ -4213,6 +4218,7 @@ rb_gc_vm_weak_table_foreach(vm_table_foreach_callback_func callback,
         .update_callback = update_callback,
         .data = data,
         .weak_only = weak_only,
+        .generic_fields_pending_updates = NULL,
     };
 
     switch (table) {
@@ -4255,11 +4261,33 @@ rb_gc_vm_weak_table_foreach(vm_table_foreach_callback_func callback,
       case RB_GC_VM_GENERIC_FIELDS_TABLE: {
         st_table *generic_fields_tbl = rb_generic_fields_tbl_get();
         if (generic_fields_tbl) {
+            DURING_GC_COULD_MALLOC_REGION_START();
+            {
+                foreach_data.generic_fields_pending_updates =
+                    st_init_numtable_with_size(generic_fields_tbl->num_entries + 1);
+            }
+            DURING_GC_COULD_MALLOC_REGION_END();
+
             st_foreach(
                 generic_fields_tbl,
                 vm_weak_table_gen_fields_foreach,
                 (st_data_t)&foreach_data
             );
+
+            if (foreach_data.generic_fields_pending_updates->num_entries > 0) {
+                DURING_GC_COULD_MALLOC_REGION_START();
+                {
+                    st_foreach(
+                        foreach_data.generic_fields_pending_updates,
+                        st_insert_generic_fields_i,
+                        (st_data_t)generic_fields_tbl
+                    );
+                }
+                DURING_GC_COULD_MALLOC_REGION_END();
+            }
+
+            st_free_table(foreach_data.generic_fields_pending_updates);
+            foreach_data.generic_fields_pending_updates = NULL;
         }
         break;
       }
