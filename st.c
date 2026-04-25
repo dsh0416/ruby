@@ -591,17 +591,6 @@ bins_size(const st_table *tab)
 #define ST_CTRL_EMPTY 0xff
 #define ST_CTRL_DELETED 0xfe
 
-typedef struct {
-    uint64_t ctrl;
-    st_index_t bins[ST_SWISS_GROUP_SIZE];
-} st_swiss_bin_group_t;
-
-static inline st_swiss_bin_group_t *
-st_swiss_groups(const st_table *tab)
-{
-    return (st_swiss_bin_group_t *)tab->bins;
-}
-
 static inline st_index_t
 st_swiss_groups_num(const st_table *tab)
 {
@@ -641,29 +630,36 @@ st_swiss_ctrl_shift(st_index_t ind)
 static inline st_index_t
 st_swiss_get_bin(const st_table *tab, st_index_t ind)
 {
-    return st_swiss_groups(tab)[st_swiss_group_ind(ind)].bins[st_swiss_group_offset(ind)];
+    return tab->bins[ind];
 }
 
 static inline void
 st_swiss_set_bin(st_table *tab, st_index_t ind, st_index_t bin)
 {
-    st_swiss_groups(tab)[st_swiss_group_ind(ind)].bins[st_swiss_group_offset(ind)] = bin;
+    tab->bins[ind] = bin;
+}
+
+static inline uint64_t *
+st_swiss_ctrl_groups(const st_table *tab)
+{
+    return (uint64_t *)((char *)tab->bins + get_bins_num(tab) * sizeof(st_index_t));
 }
 
 static inline void
 st_swiss_set_ctrl(st_table *tab, st_index_t ind, unsigned char ctrl)
 {
-    st_swiss_bin_group_t *group = &st_swiss_groups(tab)[st_swiss_group_ind(ind)];
+    uint64_t *group = &st_swiss_ctrl_groups(tab)[st_swiss_group_ind(ind)];
     unsigned int shift = st_swiss_ctrl_shift(ind);
     uint64_t mask = UINT64_C(0xff) << shift;
 
-    group->ctrl = (group->ctrl & ~mask) | ((uint64_t)ctrl << shift);
+    *group = (*group & ~mask) | ((uint64_t)ctrl << shift);
 }
 
 static inline st_index_t
 st_bins_alloc_size(const st_table *tab)
 {
-    return st_swiss_groups_num(tab) * sizeof(st_swiss_bin_group_t);
+    return get_bins_num(tab) * sizeof(st_index_t)
+           + st_swiss_groups_num(tab) * sizeof(uint64_t);
 }
 
 static inline st_index_t *
@@ -715,7 +711,7 @@ st_swiss_match_byte(uint64_t word, unsigned char byte)
 static inline uint64_t
 st_swiss_ctrl_group(const st_table *tab, st_index_t ind)
 {
-    return st_swiss_groups(tab)[st_swiss_group_ind(ind)].ctrl;
+    return st_swiss_ctrl_groups(tab)[st_swiss_group_ind(ind)];
 }
 
 static inline st_index_t
@@ -777,12 +773,12 @@ static void
 initialize_bins(st_table *tab)
 {
 #if ST_USE_SWISS_BINS
-    st_swiss_bin_group_t *groups = st_swiss_groups(tab);
+    uint64_t *ctrl_groups = st_swiss_ctrl_groups(tab);
     st_index_t i, groups_num = st_swiss_groups_num(tab);
 
+    memset(tab->bins, 0, get_bins_num(tab) * sizeof(st_index_t));
     for (i = 0; i < groups_num; i++) {
-        groups[i].ctrl = st_swiss_repeat_byte(ST_CTRL_EMPTY);
-        memset(groups[i].bins, 0, sizeof(groups[i].bins));
+        ctrl_groups[i] = st_swiss_repeat_byte(ST_CTRL_EMPTY);
     }
 #else
     memset(tab->bins, 0, bins_size(tab));
