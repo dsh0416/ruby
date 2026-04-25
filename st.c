@@ -200,7 +200,15 @@ static const struct st_hash_type type_strcasehash = {
 
 #define EQUAL(tab,x,y) ((x) == (y) || (*(tab)->type->compare)((x),(y)) == 0)
 #if ST_USE_SWISS_BINS
+#ifndef ST_SWISS_STORE_FULL_HASH
+#define ST_SWISS_STORE_FULL_HASH 1
+#endif
+
+#if ST_SWISS_STORE_FULL_HASH
+typedef st_hash_t st_stored_hash_t;
+#else
 typedef uint32_t st_stored_hash_t;
+#endif
 #endif
 
 static inline st_index_t get_allocated_entries(const st_table *tab);
@@ -208,7 +216,11 @@ static inline size_t st_entries_memsize(const st_table *tab);
 static inline size_t st_table_alloc_memsize(const st_table *tab);
 
 #if ST_USE_SWISS_BINS
+#if ST_SWISS_STORE_FULL_HASH
+#define ST_RESERVED_HASH_VAL (~(st_hash_t)0)
+#else
 #define ST_RESERVED_HASH_VAL ((st_hash_t)UINT32_MAX)
+#endif
 #define ST_RESERVED_HASH_SUBSTITUTION_VAL ((st_hash_t)0)
 
 static inline st_index_t
