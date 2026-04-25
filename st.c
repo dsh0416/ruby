@@ -1311,18 +1311,13 @@ static inline st_index_t
 find_entry(st_table *tab, st_hash_t hash_value, st_data_t key)
 {
     int eq_p, rebuilt_p;
-    unsigned int old_rebuilds_num;
     st_index_t i, bound;
     st_table_entry *entries;
 
     bound = tab->entries_bound;
     entries = tab->entries;
     for (i = tab->entries_start; i < bound; i++) {
-        if (ST_HASH_AT_IDX(tab, i) != hash_value)
-            continue;
-        old_rebuilds_num = tab->rebuilds_num;
-        eq_p = EQUAL(tab, key, entries[i].key);
-        rebuilt_p = old_rebuilds_num != tab->rebuilds_num;
+        DO_PTR_EQUAL_CHECK(tab, &entries[i], hash_value, key, eq_p, rebuilt_p);
         if (EXPECT(rebuilt_p, 0))
             return REBUILT_TABLE_ENTRY_IND;
         if (eq_p)
